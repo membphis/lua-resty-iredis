@@ -93,55 +93,41 @@ local function is_redis_null( res )
 end
 
 
-local function do_command(self, cmd, ... )
-    if self._reqs then
-        table.insert(self._reqs, {cmd, ...})
-        return
-    end
-
+-- change connect address as you need
+function _M.get_red( self)
     local redis, err = redis_c:new()
     if not redis then
         return nil, err
     end
 
-    local ok, err = self:connect_mod(redis)
-    if not ok or err then
-        return nil, err
-    end
-
-    local fun = redis[cmd]
-    local result, err = fun(redis, ...)
-    if not result or err then
-        return nil, err
-    end
-
-    if is_redis_null(result) then
-        result = nil
-    end
-
-    self:set_keepalive_mod(redis)
-
-    return result, err
-end
-
-
-for i = 1, #commands do
-    local cmd = commands[i]
-    _M[cmd] =
-            function (self, ...)
-                return do_command(self, cmd, ...)
-            end
-end
-
-
-function _M.connect_mod( self, redis )
     redis:set_timeout(self.timeout)
-    return redis:connect(self.ip, self.port)
+    local ok, err = redis:connect(self.redis_ip, self.redis_port, { pool = self.pool })
+    if not ok then
+        return nil, err
+    end
+
+    local count, err = redis:get_reused_times()
+    if 0 == count then
+        if #self.redis_pass > 0 then
+            ok, err = redis:auth(self.redis_pass)
+            if not ok then
+                ngx.log(ngx.ERR, "failed to auth: ", err)
+                return nil, err
+            end
+        end
+
+        if self.db_index > 0 then
+            redis:select(self.db_index)
+        end
+    end
+
+    return redis
 end
 
 
-function _M.set_keepalive_mod( self, redis )
-    return redis:set_keepalive(self.keepalive_timeout, self.keepalive_size)
+function _M.set_keepalive_mod( redis )
+    -- put it into the connection pool of size 100, with 60 seconds max idle time
+    return redis:set_keepalive(60000, 1000)
 end
 
 
@@ -159,14 +145,9 @@ function _M.commit_pipeline( self )
         self._reqs = nil
     end
 
-    local redis, err = redis_c:new()
-    if not redis then
+    local redis, err = self:get_red()
+    if err then
         return nil, err
-    end
-
-    local ok, err = self:connect_mod(redis)
-    if not ok then
-        return {}, err
     end
 
     redis:init_pipeline()
@@ -184,11 +165,11 @@ function _M.commit_pipeline( self )
 
     if is_redis_null(results) then
         results = {}
-        ngx.log(ngx.INFO, "is null")
+        ngx.log(ngx.WARN, "is null")
     end
     -- table.remove (results , 1)
 
-    self:set_keepalive_mod(redis)
+    self.set_keepalive_mod(redis)
 
     for i,value in ipairs(results) do
         if is_redis_null(value) then
@@ -201,13 +182,8 @@ end
 
 
 function _M.subscribe( self, channel )
-    local redis, err = redis_c:new()
-    if not redis then
-        return nil, err
-    end
-
-    local ok, err = self:connect_mod(redis)
-    if not ok or err then
+    local redis, err = self:get_red()
+    if err then
         return nil, err
     end
 
@@ -216,41 +192,73 @@ function _M.subscribe( self, channel )
         return nil, err
     end
 
-    local function do_read_func ( do_read )
-        if do_read == nil or do_read == true then
-            res, err = redis:read_reply()
-            if not res then
-                return nil, err
-            end
-            return res
-        end
-
-        redis:unsubscribe(channel)
-        self.set_keepalive_mod(redis)
-        return 
+    res, err = redis:read_reply()
+    if not res then
+        return nil, err
     end
-    
-    return do_read_func
+
+    redis:unsubscribe(channel)
+    self.set_keepalive_mod(redis)
+
+    return res, err
+end
+
+
+local function do_command(self, cmd, ... )
+    if self._reqs then
+        table.insert(self._reqs, {cmd, ...})
+        return
+    end
+
+    local redis, err = self:get_red()
+    if err then
+        return nil, err
+    end
+
+    local fun = redis[cmd]
+    local result, err = fun(redis, ...)
+    if not result or err then
+        -- ngx.log(ngx.ERR, "pipeline result:", result, " err:", err)
+        return nil, err
+    end
+
+    if is_redis_null(result) then
+        result = nil
+    end
+
+    self.set_keepalive_mod(redis)
+
+    return result, err
+end
+
+
+for i = 1, #commands do
+    local cmd = commands[i]
+    _M[cmd] =
+            function (self, ...)
+                return do_command(self, cmd, ...)
+            end
 end
 
 
 function _M.new(self, opts)
     opts = opts or {}
-    local timeout = (opts.timeout and opts.timeout * 1000) or 1000
+    local timeout = (opts.timeout and opts.timeout * 10000) or 100
     local db_index= opts.db_index or 0
-    local ip      = opts.ip or "127.0.0.1"
-    local port    = opts.port or 6379
-    local keepalive_size    = keepalive_size or 1000
-    local keepalive_timeout = keepalive_timeout or 60000
+    local redis_ip = opts.redis_ip or "127.0.0.1"
+    local redis_port = opts.redis_port or 6379
+    local redis_pass = opts.redis_pass or ""
+    local pool    = opts.pool or redis_ip .. redis_port .. redis_pass .. db_index
+
 
     return setmetatable({
             timeout = timeout,
             db_index = db_index,
-            ip       = ip,
-            port     = port,
-            keepalive_size = keepalive_size,
-            keepalive_timeout = keepalive_timeout
-            }, mt)
+            redis_ip = redis_ip,
+            redis_port = redis_port,
+            redis_pass = redis_pass,
+            pool = pool,
+            _reqs = nil }, mt)
 end
 
 
